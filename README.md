@@ -6,7 +6,7 @@ desktop window.
 
 ## Features
 
-- Tray icon showing the Zaopin logo above a battery fill bar, both tinted by
+- Tray icon showing a mouse above a battery fill bar, both tinted by
   level: green above 50%, yellow down to 21%, red at 20% and below, blue while
   charging, grey with the last known level when the mouse stops responding.
   The exact percentage is in the tooltip and menu.

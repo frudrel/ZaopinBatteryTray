@@ -641,31 +641,15 @@ static class HubServer
     }
 }
 
-// The Zaopin logo, tinted by battery level, above a fill bar.
+// A top-down mouse, tinted by battery level, above a fill bar.
 static class IconPainter
 {
-    // The logo is pixel art, drawn as a grid of bands so it stays crisp at any
-    // icon size: every band gets at least one pixel. Widths and heights are in
-    // the logo's own proportions.
-    static readonly int[] ColWeights = { 30, 30, 200, 30 };   // left side, nub, middle, right side
-    static readonly int[] RowWeights = { 12, 30, 20, 22, 18, 25, 25, 30, 45, 30 };
-    static readonly string[] Cells =
-    {
-        ".#..",   // nub on top
-        "####",   // upper block: top edge
-        "#..#",   //   slot
-        "####",   //   middle bar
-        "#..#",   //   slot
-        "####",   //   bottom edge
-        "....",   // gap
-        "####",   // lower hook: top bar
-        "#...",   //   opening
-        "####",   //   bottom bar
-    };
-
     static readonly Color Orange = Color.FromArgb(232, 112, 58);
     static readonly Color Grey = Color.FromArgb(140, 140, 140);
+    static readonly Color Ink = Color.FromArgb(230, 18, 18, 24);           // seams and outline
+    static readonly Color WheelGrey = Color.FromArgb(95, 98, 104);
     const int LowColor = 20;
+    const float Aspect = 0.6f;                                            // body width / height
 
     public static Icon Draw(BatteryStatus st)
     {
@@ -697,59 +681,81 @@ static class IconPainter
                     g.FillRectangle(fill, 0, size - barH, Math.Max(1, size * Math.Min(st.Percent, 100) / 100), barH);
             }
 
-            // Logo in the space above, keeping its proportions.
-            int logoH = size - barH - Math.Max(1, size / 11);
-            int logoW = Math.Min(size, (int)Math.Round(logoH * Sum(ColWeights) / (double)Sum(RowWeights)));
-            int[] cols = Allocate(ColWeights, logoW), rows = Allocate(RowWeights, logoH);
-            using (var brush = new SolidBrush(color))
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            float h = size - barH - Math.Max(1, size / 11);
+            float w = h * Aspect;
+            bool detailed = size >= 24;
+            float sideW = detailed ? Math.Max(1.5f, w * 0.12f) : 0;          // room for side buttons on the left
+            float x = (size - w + sideW) / 2f, y = 0;
+            float line = Math.Max(1f, size / 22f);
+
+            using (var body = MouseBody(x, y, w, h))
             {
-                int y = 0;
-                for (int r = 0; r < rows.Length; r++)
+                // Side buttons peek out from the left edge.
+                if (detailed)
                 {
-                    int x = (size - logoW) / 2;
-                    for (int c = 0; c < cols.Length; c++)
+                    using (var b = new SolidBrush(WheelGrey))
                     {
-                        if (Cells[r][c] == '#') g.FillRectangle(brush, x, y, cols[c], rows[r]);
-                        x += cols[c];
+                        float bw = sideW + w * 0.06f, bh = h * 0.15f;
+                        FillRounded(g, b, x - sideW, y + h * 0.27f, bw, bh, bw / 2);
+                        FillRounded(g, b, x - sideW, y + h * 0.27f + bh + line, bw, bh, bw / 2);
                     }
-                    y += rows[r];
                 }
+
+                using (var b = new SolidBrush(color)) g.FillPath(b, body);
+
+                // Button seams: down the middle, and across where the buttons end.
+                var clip = g.Clip;
+                g.SetClip(body);
+                using (var pen = new Pen(Ink, line))
+                {
+                    float cx = x + w / 2, seamY = y + h * 0.45f;
+                    g.DrawLine(pen, cx, y, cx, seamY);
+                    if (detailed) g.DrawLine(pen, x, seamY, x + w, seamY);
+                }
+
+                // Scroll wheel.
+                float ww = Math.Max(2f, w * 0.22f), wh = h * 0.2f;
+                float wx = x + (w - ww) / 2, wy = y + h * 0.1f;
+                using (var b = new SolidBrush(Ink)) FillRounded(g, b, wx - line / 2, wy - line / 2, ww + line, wh + line, (ww + line) / 2);
+                using (var b = new SolidBrush(WheelGrey)) FillRounded(g, b, wx + line / 2, wy + line / 2, ww - line, wh - line, (ww - line) / 2);
+                g.Clip = clip;
+
+                if (detailed)
+                    using (var pen = new Pen(Ink, line * 0.75f)) g.DrawPath(pen, body);
             }
         }
         return bmp;
     }
 
-    // Splits total pixels across bands in proportion to their weights, at least one each.
-    static int[] Allocate(int[] weights, int total)
+    // Narrower rounded top, fuller rounded bottom, like the mouse seen from above.
+    static GraphicsPath MouseBody(float x, float y, float w, float h)
     {
-        int sum = Sum(weights);
-        var sizes = new int[weights.Length];
-        var ideal = new double[weights.Length];
-        int used = 0;
-        for (int i = 0; i < weights.Length; i++)
-        {
-            ideal[i] = weights[i] * (double)total / sum;
-            sizes[i] = Math.Max(1, (int)ideal[i]);
-            used += sizes[i];
-        }
-        while (used != total)
-        {
-            // Grow the band furthest under its share, or shrink the one furthest over.
-            int pick = -1;
-            for (int i = 0; i < sizes.Length; i++)
-            {
-                if (used > total && sizes[i] <= 1) continue;
-                double gap = ideal[i] - sizes[i];
-                if (pick < 0 || (used < total ? gap > ideal[pick] - sizes[pick] : gap < ideal[pick] - sizes[pick])) pick = i;
-            }
-            if (pick < 0) break;
-            sizes[pick] += used < total ? 1 : -1;
-            used += used < total ? 1 : -1;
-        }
-        return sizes;
+        var p = new GraphicsPath();
+        float topH = h * 0.42f, botH = h * 0.5f, inset = w * 0.04f;
+        p.AddArc(x + inset, y, w - 2 * inset, topH, 180, 180);
+        p.AddBezier(x + w - inset, y + topH / 2, x + w - inset, y + h * 0.4f, x + w, y + h * 0.5f, x + w, y + h - botH / 2);
+        p.AddArc(x, y + h - botH, w, botH, 0, 180);
+        p.AddBezier(x, y + h - botH / 2, x, y + h * 0.5f, x + inset, y + h * 0.4f, x + inset, y + topH / 2);
+        p.CloseFigure();
+        return p;
     }
 
-    static int Sum(int[] values) { int s = 0; foreach (int v in values) s += v; return s; }
+    static void FillRounded(Graphics g, Brush b, float x, float y, float w, float h, float r)
+    {
+        if (w <= 0 || h <= 0) return;
+        r = Math.Min(r, Math.Min(w, h) / 2);
+        using (var p = new GraphicsPath())
+        {
+            p.AddArc(x, y, 2 * r, 2 * r, 180, 90);
+            p.AddArc(x + w - 2 * r, y, 2 * r, 2 * r, 270, 90);
+            p.AddArc(x + w - 2 * r, y + h - 2 * r, 2 * r, 2 * r, 0, 90);
+            p.AddArc(x, y + h - 2 * r, 2 * r, 2 * r, 90, 90);
+            p.CloseFigure();
+            g.FillPath(b, p);
+        }
+    }
 }
 
 // Learns how fast the battery drains while the mouse is awake.
