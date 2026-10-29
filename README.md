@@ -6,9 +6,13 @@ desktop window.
 
 ## Features
 
-- Tray icon with the battery percentage and a fill bar: green above 50%,
-  yellow down to 21%, red at 20% and below, blue while charging, grey with the
-  last known level while the mouse sleeps.
+- Tray icon showing the Zaopin logo above a battery fill bar, both tinted by
+  level: green above 50%, yellow down to 21%, red at 20% and below, blue while
+  charging, grey with the last known level when the mouse stops responding.
+  The exact percentage is in the tooltip and menu.
+- Short gaps (the mouse's radio dozing between movements) are bridged: the last
+  reading stays up until the mouse has been silent for 3 minutes. Failed reads
+  are logged to `%LOCALAPPDATA%\ZaopinBatteryTray\battery.log`.
 - Low-battery notification at 20%.
 - Estimated time left, learned from how fast the battery drains while the
   mouse is awake.
@@ -16,6 +20,18 @@ desktop window.
   its own Edge app window, running from an offline copy on this PC.
 - **Update offline copy**: re-downloads the Control Hub from controlhub.top.
 - **Start with Windows** toggle.
+
+## Install
+
+Download `ZaopinBatteryTray.exe` and `install.ps1` from the latest release into
+the same folder, then run:
+
+```
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+It copies the app to `%LOCALAPPDATA%\ZaopinBatteryTray`, adds it to Windows
+startup, and starts it. Run it again to update.
 
 ## Build
 

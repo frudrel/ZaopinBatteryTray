@@ -7,6 +7,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -24,7 +25,7 @@ static class Program
             // Console check: prints one reading and exits.
             var st = BatteryReader.Read();
             AttachConsole(-1);
-            Console.WriteLine("\nconnected={0} percent={1} charging={2} mV={3} name={4}", st.Connected, st.Percent, st.Charging, st.Millivolts, st.Name);
+            Console.WriteLine("\nconnected={0} percent={1} charging={2} mV={3} name={4} error={5}", st.Connected, st.Percent, st.Charging, st.Millivolts, st.Name, st.Error);
             return;
         }
         if (args.Length > 0 && args[0] == "--download")
@@ -61,6 +62,7 @@ class BatteryStatus
     public int Millivolts;
     public bool Charging;
     public string Name = "Zaopin mouse";
+    public string Error;          // why the last read failed, for the log
 }
 
 class TrayContext : ApplicationContext
@@ -82,6 +84,9 @@ class TrayContext : ApplicationContext
     Icon currentIcon;
     bool lowWarned;
     int lastPercent = -1;
+    int missedReads;
+    BatteryStatus lastGood;
+    const int MissesBeforeAsleep = 3;   // polls in a row (3 minutes) before calling the mouse unresponsive
 
     public TrayContext()
     {
@@ -163,13 +168,27 @@ class TrayContext : ApplicationContext
 
         BatteryStatus st;
         try { st = BatteryReader.Read(); }
-        catch { st = new BatteryStatus(); }
+        catch (Exception ex) { st = new BatteryStatus { Error = ex.GetType().Name + ": " + ex.Message }; }
+
+        if (st.Connected)
+        {
+            if (missedReads > 0) Log.Write("read ok again after " + missedReads + " missed: " + st.Percent + "%, " + st.Millivolts + " mV");
+            missedReads = 0;
+            lastGood = st;
+            drain.Add(st);
+        }
+        else
+        {
+            missedReads++;
+            Log.Write("read failed (" + missedReads + " in a row): " + (st.ReceiverFound ? "" : "receiver not found; ") + (st.Error ?? "unknown"));
+            // The radio dozes during short pauses; keep the last reading until it has been quiet a while.
+            // (The drain tracker skips misses; gaps over its limit aren't counted anyway.)
+            if (st.ReceiverFound && lastGood != null && missedReads < MissesBeforeAsleep) st = lastGood;
+        }
 
         // Keep showing the last known level (greyed) while the mouse sleeps.
         if (st.Connected && st.Percent >= 0) lastPercent = st.Percent;
         else if (lastPercent >= 0) st.Percent = lastPercent;
-
-        drain.Add(st);
         double? hoursLeft = st.Connected && st.Percent >= 0 && !st.Charging ? drain.HoursLeft(st.Percent) : null;
         string left = hoursLeft.HasValue ? FormatHours(hoursLeft.Value) : null;
 
@@ -182,8 +201,8 @@ class TrayContext : ApplicationContext
         }
         else if (st.ReceiverFound)
         {
-            text = "Mouse asleep or off" + (st.Percent >= 0 ? " (last: " + st.Percent + "%)" : "");
-            estimate = "Move the mouse to wake it";
+            text = "Mouse not responding" + (st.Percent >= 0 ? " (last: " + st.Percent + "%)" : "");
+            estimate = "It may be off, asleep or out of range";
         }
         else { text = "Zaopin receiver not plugged in"; estimate = "No estimate"; }
 
@@ -305,6 +324,32 @@ class ControlHub
             if (File.Exists(p)) return p;
         }
         return null;
+    }
+}
+
+// Small text log in %LOCALAPPDATA%\ZaopinBatteryTray\battery.log, trimmed to its
+// newer half once it passes 64 KB.
+static class Log
+{
+    const long MaxBytes = 64 * 1024;
+    static readonly string Path_ = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ZaopinBatteryTray", "battery.log");
+
+    public static void Write(string message)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(Path_));
+            var info = new FileInfo(Path_);
+            if (info.Exists && info.Length > MaxBytes)
+            {
+                string[] lines = File.ReadAllLines(Path_);
+                File.WriteAllLines(Path_, lines.Skip(lines.Length / 2).ToArray());
+            }
+            File.AppendAllText(Path_, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + message + Environment.NewLine);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 }
 
@@ -596,30 +641,51 @@ static class HubServer
     }
 }
 
+// The Zaopin logo, tinted by battery level, above a fill bar.
 static class IconPainter
 {
+    // The logo is pixel art, drawn as a grid of bands so it stays crisp at any
+    // icon size: every band gets at least one pixel. Widths and heights are in
+    // the logo's own proportions.
+    static readonly int[] ColWeights = { 30, 30, 200, 30 };   // left side, nub, middle, right side
+    static readonly int[] RowWeights = { 12, 30, 20, 22, 18, 25, 25, 30, 45, 30 };
+    static readonly string[] Cells =
+    {
+        ".#..",   // nub on top
+        "####",   // upper block: top edge
+        "#..#",   //   slot
+        "####",   //   middle bar
+        "#..#",   //   slot
+        "####",   //   bottom edge
+        "....",   // gap
+        "####",   // lower hook: top bar
+        "#...",   //   opening
+        "####",   //   bottom bar
+    };
+
+    static readonly Color Orange = Color.FromArgb(232, 112, 58);
+    static readonly Color Grey = Color.FromArgb(140, 140, 140);
+    const int LowColor = 20;
+
     public static Icon Draw(BatteryStatus st)
     {
-        int size = SystemInformation.SmallIconSize.Width;
-        using (var bmp = new Bitmap(size, size))
+        using (var bmp = Render(st, SystemInformation.SmallIconSize.Width))
+            return Icon.FromHandle(bmp.GetHicon());
+    }
+
+    public static Bitmap Render(BatteryStatus st, int size)
+    {
+        Color color = !st.Connected ? Grey
+                    : st.Percent < 0 ? Orange
+                    : st.Charging ? Color.FromArgb(80, 160, 255)
+                    : st.Percent > 50 ? Color.FromArgb(70, 210, 90)
+                    : st.Percent > LowColor ? Color.FromArgb(240, 200, 40)
+                    : Color.FromArgb(240, 70, 60);
+
+        var bmp = new Bitmap(size, size);
         using (var g = Graphics.FromImage(bmp))
         {
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
             g.Clear(Color.Transparent);
-
-            Color color;
-            string label;
-            if (!st.Connected) { color = Color.FromArgb(140, 140, 140); label = st.Percent >= 0 ? Label(st.Percent) : "–"; }
-            else if (st.Percent < 0) { color = Color.White; label = "?"; }
-            else
-            {
-                color = st.Charging ? Color.FromArgb(80, 160, 255)
-                      : st.Percent > 50 ? Color.FromArgb(70, 210, 90)
-                      : st.Percent > LowColor ? Color.FromArgb(240, 200, 40)
-                      : Color.FromArgb(240, 70, 60);
-                label = Label(st.Percent);
-            }
 
             // Fill bar along the bottom edge.
             int barH = Math.Max(2, size / 8);
@@ -631,26 +697,59 @@ static class IconPainter
                     g.FillRectangle(fill, 0, size - barH, Math.Max(1, size * Math.Min(st.Percent, 100) / 100), barH);
             }
 
-            // Number, sized to fill the remaining space.
-            float fontPx = label.Length >= 2 ? size * 0.72f : size * 0.85f;
-            using (var font = new Font("Segoe UI", fontPx, FontStyle.Bold, GraphicsUnit.Pixel))
-            using (var path = new GraphicsPath())
-            using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+            // Logo in the space above, keeping its proportions.
+            int logoH = size - barH - Math.Max(1, size / 11);
+            int logoW = Math.Min(size, (int)Math.Round(logoH * Sum(ColWeights) / (double)Sum(RowWeights)));
+            int[] cols = Allocate(ColWeights, logoW), rows = Allocate(RowWeights, logoH);
+            using (var brush = new SolidBrush(color))
             {
-                var rect = new RectangleF(-2, -1, size + 4, size - barH + 1);
-                path.AddString(label, font.FontFamily, (int)font.Style, fontPx, rect, sf);
-                using (var outline = new Pen(Color.FromArgb(200, 0, 0, 0), Math.Max(1.5f, size / 10f)) { LineJoin = LineJoin.Round })
-                    g.DrawPath(outline, path);
-                using (var brush = new SolidBrush(color))
-                    g.FillPath(brush, path);
+                int y = 0;
+                for (int r = 0; r < rows.Length; r++)
+                {
+                    int x = (size - logoW) / 2;
+                    for (int c = 0; c < cols.Length; c++)
+                    {
+                        if (Cells[r][c] == '#') g.FillRectangle(brush, x, y, cols[c], rows[r]);
+                        x += cols[c];
+                    }
+                    y += rows[r];
+                }
             }
-            return Icon.FromHandle(bmp.GetHicon());
         }
+        return bmp;
     }
 
-    static string Label(int percent) { return percent >= 100 ? "F" : percent.ToString(); }
+    // Splits total pixels across bands in proportion to their weights, at least one each.
+    static int[] Allocate(int[] weights, int total)
+    {
+        int sum = Sum(weights);
+        var sizes = new int[weights.Length];
+        var ideal = new double[weights.Length];
+        int used = 0;
+        for (int i = 0; i < weights.Length; i++)
+        {
+            ideal[i] = weights[i] * (double)total / sum;
+            sizes[i] = Math.Max(1, (int)ideal[i]);
+            used += sizes[i];
+        }
+        while (used != total)
+        {
+            // Grow the band furthest under its share, or shrink the one furthest over.
+            int pick = -1;
+            for (int i = 0; i < sizes.Length; i++)
+            {
+                if (used > total && sizes[i] <= 1) continue;
+                double gap = ideal[i] - sizes[i];
+                if (pick < 0 || (used < total ? gap > ideal[pick] - sizes[pick] : gap < ideal[pick] - sizes[pick])) pick = i;
+            }
+            if (pick < 0) break;
+            sizes[pick] += used < total ? 1 : -1;
+            used += used < total ? 1 : -1;
+        }
+        return sizes;
+    }
 
-    const int LowColor = 20;
+    static int Sum(int[] values) { int s = 0; foreach (int v in values) s += v; return s; }
 }
 
 // Learns how fast the battery drains while the mouse is awake.
@@ -754,20 +853,30 @@ static class BatteryReader
     const byte ReportId = 0x08, CmdBattery = 0x04;
     const int ReportLen = 17, ReplyTimeoutMs = 1000;
 
+    const int Attempts = 3, RetryDelayMs = 400;
+
     public static BatteryStatus Read()
     {
         var st = new BatteryStatus();
-        foreach (string path in Native.HidPaths(Vid))
+        for (int attempt = 0; attempt < Attempts; attempt++)
         {
-            if (!IsCommandChannel(path)) continue;
-            st.ReceiverFound = true;
-            byte[] reply = Query(path, CmdBattery);
-            if (reply == null || reply[6] > 100) continue;
-            st.Connected = true;
-            st.Percent = reply[6];
-            st.Charging = reply[7] != 0;
-            st.Millivolts = (reply[8] << 8) | reply[9];
-            return st;
+            if (attempt > 0) System.Threading.Thread.Sleep(RetryDelayMs);
+            foreach (string path in Native.HidPaths(Vid))
+            {
+                if (!IsCommandChannel(path)) continue;
+                st.ReceiverFound = true;
+                string error;
+                byte[] reply = Query(path, CmdBattery, out error);
+                if (reply != null && reply[6] > 100) error = "unexpected reply " + BitConverter.ToString(reply);
+                if (error != null) { st.Error = error; continue; }
+                st.Connected = true;
+                st.Percent = reply[6];
+                st.Charging = reply[7] != 0;
+                st.Millivolts = (reply[8] << 8) | reply[9];
+                st.Error = null;
+                return st;
+            }
+            if (!st.ReceiverFound) return st;
         }
         return st;
     }
@@ -786,10 +895,12 @@ static class BatteryReader
         }
     }
 
-    static byte[] Query(string path, byte cmd)
+    // Sends one command and waits for its reply. On failure returns null and says why.
+    static byte[] Query(string path, byte cmd, out string error)
     {
+        error = null;
         var h = Native.CreateFileW(path, 0xC0000000u, 3, IntPtr.Zero, 3, Native.FILE_FLAG_OVERLAPPED, IntPtr.Zero);
-        if (h.IsInvalid) return null;
+        if (h.IsInvalid) { error = "couldn't open receiver (Windows error " + Marshal.GetLastWin32Error() + ")"; return null; }
         using (var fs = new FileStream(h, FileAccess.ReadWrite, ReportLen, true))
         {
             var req = new byte[ReportLen];
@@ -797,18 +908,21 @@ static class BatteryReader
             int sum = 0;
             for (int i = 0; i < ReportLen - 1; i++) sum += req[i];
             req[ReportLen - 1] = (byte)((0x55 - sum) & 0xFF);
-            try { fs.Write(req, 0, ReportLen); } catch (IOException) { return null; }
+            try { fs.Write(req, 0, ReportLen); }
+            catch (IOException ex) { error = "send failed: " + ex.Message; return null; }
 
             var deadline = DateTime.UtcNow.AddMilliseconds(ReplyTimeoutMs);
+            string other = null;
             while (true)
             {
                 int wait = (int)(deadline - DateTime.UtcNow).TotalMilliseconds;
-                if (wait <= 0) return null;
+                if (wait <= 0) { error = "no reply" + (other != null ? " (last report " + other + ")" : ""); return null; }
                 var buf = new byte[ReportLen];
                 var task = fs.ReadAsync(buf, 0, ReportLen);
-                try { if (!task.Wait(wait)) return null; }   // disposing the stream cancels the read
-                catch (AggregateException) { return null; }
+                try { if (!task.Wait(wait)) { error = "no reply" + (other != null ? " (last report " + other + ")" : ""); return null; } }   // disposing the stream cancels the read
+                catch (AggregateException ex) { error = "read failed: " + ex.InnerException.Message; return null; }
                 if (task.Result == ReportLen && buf[0] == ReportId && buf[1] == cmd) return buf;
+                other = BitConverter.ToString(buf, 0, task.Result);
             }
         }
     }
